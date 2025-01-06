@@ -3,21 +3,29 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram"
+	"github.com/ivanpirog/coloredcobra"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
+	"golang.org/x/net/proxy"
 
 	"github.com/iyear/tdl/core/logctx"
+	"github.com/iyear/tdl/core/storage"
+	tclientcore "github.com/iyear/tdl/core/tclient"
 	"github.com/iyear/tdl/core/util/fsutil"
 	"github.com/iyear/tdl/core/util/logutil"
+	"github.com/iyear/tdl/core/util/netutil"
 	"github.com/iyear/tdl/pkg/consts"
+	"github.com/iyear/tdl/pkg/extensions"
 	"github.com/iyear/tdl/pkg/kv"
 	"github.com/iyear/tdl/pkg/tclient"
 )
@@ -35,7 +43,28 @@ var (
 	}
 )
 
+// command groups
+var (
+	groupAccount = &cobra.Group{
+		ID:    "account",
+		Title: "Account related",
+	}
+	groupTools = &cobra.Group{
+		ID:    "tools",
+		Title: "Tools",
+	}
+	groupExtensions = &cobra.Group{
+		ID:    "extensions",
+		Title: "Extensions",
+	}
+)
+
 func New() *cobra.Command {
+	// allow PersistentPreRun to be called for every command
+	cobra.EnableTraverseRunHooks = true
+
+	em := extensions.NewManager(consts.ExtensionsPath)
+
 	cmd := &cobra.Command{
 		Use:           "tdl",
 		Short:         "Telegram Downloader, but more than a downloader",
@@ -63,12 +92,24 @@ func New() *cobra.Command {
 				}
 			}
 
-			storage, err := kv.NewWithMap(viper.GetStringMapString(consts.FlagStorage))
+			stg, err := kv.NewWithMap(viper.GetStringMapString(consts.FlagStorage))
 			if err != nil {
 				return errors.Wrap(err, "create kv storage")
 			}
 
-			cmd.SetContext(kv.With(cmd.Context(), storage))
+			cmd.SetContext(kv.With(cmd.Context(), stg))
+
+			// extension manager client proxy
+			var dialer proxy.ContextDialer = proxy.Direct
+			if p := viper.GetString(consts.FlagProxy); p != "" {
+				if t, err := netutil.NewProxy(p); err == nil {
+					dialer = t
+				}
+			}
+			em.SetClient(&http.Client{Transport: &http.Transport{
+				DialContext: dialer.DialContext,
+			}})
+
 			return nil
 		},
 		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
@@ -79,8 +120,32 @@ func New() *cobra.Command {
 		},
 	}
 
+	coloredcobra.Init(&coloredcobra.Config{
+		RootCmd:         cmd,
+		Headings:        coloredcobra.HiCyan + coloredcobra.Bold + coloredcobra.Underline,
+		Commands:        coloredcobra.HiGreen + coloredcobra.Bold,
+		CmdShortDescr:   coloredcobra.None,
+		ExecName:        coloredcobra.Bold,
+		Flags:           coloredcobra.Bold + coloredcobra.Yellow,
+		FlagsDataType:   coloredcobra.Blue,
+		FlagsDescr:      coloredcobra.None,
+		Aliases:         coloredcobra.None,
+		Example:         coloredcobra.None,
+		NoExtraNewlines: true,
+		NoBottomNewline: true,
+	})
+
+	cmd.AddGroup(groupAccount, groupTools, groupExtensions)
+
 	cmd.AddCommand(NewVersion(), NewLogin(), NewDownload(), NewForward(),
-		NewChat(), NewUpload(), NewBackup(), NewRecover(), NewMigrate(), NewGen())
+		NewChat(), NewUpload(), NewBackup(), NewRecover(), NewMigrate(),
+		NewGen(), NewExtension(em))
+
+	// append extension command to root
+	exts, _ := em.List(context.Background(), false)
+	for _, e := range exts {
+		cmd.AddCommand(NewExtensionCmd(em, e, os.Stdin, os.Stdout, os.Stderr))
+	}
 
 	cmd.PersistentFlags().StringToString(consts.FlagStorage,
 		DefaultBoltStorage,
@@ -91,7 +156,9 @@ func New() *cobra.Command {
 	cmd.PersistentFlags().StringP(consts.FlagNamespace, "n", "default", "namespace for Telegram session")
 	cmd.PersistentFlags().Bool(consts.FlagDebug, false, "enable debug mode")
 
-	cmd.PersistentFlags().IntP(consts.FlagPartSize, "s", 512*1024, "part size for transfer, max is 512*1024")
+	cmd.PersistentFlags().IntP(consts.FlagPartSize, "s", 512*1024, "part size for transfer")
+	_ = cmd.PersistentFlags().MarkDeprecated(consts.FlagPartSize, "part size has been set to maximum by default, this flag will be removed in the future")
+
 	cmd.PersistentFlags().IntP(consts.FlagThreads, "t", 4, "max threads for transfer one item")
 	cmd.PersistentFlags().IntP(consts.FlagLimit, "l", 2, "max number of concurrent tasks")
 	cmd.PersistentFlags().Int(consts.FlagPoolSize, 8, "specify the size of the DC pool, zero means infinity")
@@ -99,8 +166,6 @@ func New() *cobra.Command {
 
 	cmd.PersistentFlags().String(consts.FlagNTP, "", "ntp server host, if not set, use system time")
 	cmd.PersistentFlags().Duration(consts.FlagReconnectTimeout, 5*time.Minute, "Telegram client reconnection backoff timeout, infinite if set to 0") // #158
-
-	cmd.PersistentFlags().String(consts.FlagTest, "", "use test Telegram client, only for developer")
 
 	// completion
 	_ = cmd.RegisterFlagCompletionFunc(consts.FlagNamespace, func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -117,6 +182,15 @@ func New() *cobra.Command {
 	viper.SetEnvPrefix("tdl")
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	viper.AutomaticEnv()
+
+	// extension command format: <global-flags> <extension-name> <extension-flags>,
+	// which means parse args layer by layer. But common command flags are flat.
+	// To keep compatibility, we only set TraverseChildren to true for extension
+	// command instead of other commands.
+	foundCmd, _, err := cmd.Find(os.Args[1:])
+	if err == nil && foundCmd.GroupID == groupExtensions.ID {
+		cmd.TraverseChildren = true // allow global config to be parsed before extension command is executed
+	}
 
 	return cmd
 }
@@ -138,19 +212,27 @@ func completeExtFiles(ext ...string) completeFunc {
 	}
 }
 
-func tRun(ctx context.Context, f func(ctx context.Context, c *telegram.Client, kvd kv.KV) error, middlewares ...telegram.Middleware) error {
+func tOptions(ctx context.Context) (tclient.Options, error) {
 	// init tclient kv
 	kvd, err := kv.From(ctx).Open(viper.GetString(consts.FlagNamespace))
 	if err != nil {
-		return errors.Wrap(err, "open kv storage")
+		return tclient.Options{}, errors.Wrap(err, "open kv storage")
 	}
 	o := tclient.Options{
 		KV:               kvd,
 		Proxy:            viper.GetString(consts.FlagProxy),
 		NTP:              viper.GetString(consts.FlagNTP),
 		ReconnectTimeout: viper.GetDuration(consts.FlagReconnectTimeout),
-		Test:             viper.GetString(consts.FlagTest) != "",
 		UpdateHandler:    nil,
+	}
+
+	return o, nil
+}
+
+func tRun(ctx context.Context, f func(ctx context.Context, c *telegram.Client, kvd storage.Storage) error, middlewares ...telegram.Middleware) error {
+	o, err := tOptions(ctx)
+	if err != nil {
+		return errors.Wrap(err, "build telegram options")
 	}
 
 	client, err := tclient.New(ctx, o, false, middlewares...)
@@ -158,8 +240,8 @@ func tRun(ctx context.Context, f func(ctx context.Context, c *telegram.Client, k
 		return errors.Wrap(err, "create client")
 	}
 
-	return tclient.Run(ctx, client, func(ctx context.Context) error {
-		return f(ctx, client, kvd)
+	return tclientcore.RunWithAuth(ctx, client, func(ctx context.Context) error {
+		return f(ctx, client, o.KV)
 	})
 }
 
