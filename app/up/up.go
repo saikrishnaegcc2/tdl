@@ -12,13 +12,12 @@ import (
 	"go.uber.org/multierr"
 
 	"github.com/iyear/tdl/core/dcpool"
+	"github.com/iyear/tdl/core/storage"
+	"github.com/iyear/tdl/core/tclient"
 	"github.com/iyear/tdl/core/uploader"
 	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/iyear/tdl/pkg/consts"
-	"github.com/iyear/tdl/pkg/kv"
 	"github.com/iyear/tdl/pkg/prog"
-	"github.com/iyear/tdl/pkg/storage"
-	"github.com/iyear/tdl/pkg/tclient"
 	"github.com/iyear/tdl/pkg/utils"
 )
 
@@ -30,7 +29,7 @@ type Options struct {
 	Photo    bool
 }
 
-func Run(ctx context.Context, c *telegram.Client, kvd kv.KV, opts Options) (rerr error) {
+func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
 	files, err := walk(opts.Paths, opts.Excludes)
 	if err != nil {
 		return err
@@ -56,7 +55,6 @@ func Run(ctx context.Context, c *telegram.Client, kvd kv.KV, opts Options) (rerr
 
 	options := uploader.Options{
 		Client:   pool.Default(ctx),
-		PartSize: viper.GetInt(consts.FlagPartSize),
 		Threads:  viper.GetInt(consts.FlagThreads),
 		Iter:     newIter(files, to, opts.Photo, opts.Remove, viper.GetDuration(consts.FlagDelay)),
 		Progress: newProgress(upProgress),
